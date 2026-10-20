@@ -61,6 +61,7 @@ GIL-atomic rebind, the same lock-free idiom ``gpu_grid.py``'s
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -92,6 +93,14 @@ class VoxelSimController:
         (N,) float32 array of cumulative arc lengths for each path point.
     tool :
         Initial tool.  Update with :meth:`update_tool` on T-commands.
+    checker :
+        Optional live collision check for MACHINE-mode carve_move(),
+        ``checker(start, end, tool, is_rapid, holder) -> CollisionHit | None``.
+        None (default) = voxel/collision.check_segment() on ``grid.material``;
+        the tri-dexel backend passes dexel/collision.check_segment() bound to
+        its DexelStock. *grid* and *carver* are duck-typed the same way
+        (GpuDexelGrid / DexelCarver), so all High-Water-Mark and pre-pass
+        logic here is shared by both backends.
     """
 
     def __init__(
@@ -103,8 +112,10 @@ class VoxelSimController:
         path_feed_rates:  np.ndarray,
         tool:             ToolDefinition,
         path_line_ids:    np.ndarray | None = None,
+        checker:          Callable[..., CollisionHit | None] | None = None,
     ) -> None:
         self._grid            = grid
+        self._checker         = checker
         self._carver          = carver
         self._pts             = path_points       # (N, 3) float32
         self._arc             = path_arc_lengths  # (N,)   float32
@@ -179,6 +190,8 @@ class VoxelSimController:
     ) -> CollisionHit | None:
         if not self._collision_enabled:
             return None
+        if self._checker is not None:
+            return self._checker(start, end, tool, is_rapid, self._holder)
         return check_segment(
             self._grid.material, self._grid.bbox, self._grid.voxel_size,
             start, end, tool, is_rapid, self._holder,

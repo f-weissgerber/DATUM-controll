@@ -18,6 +18,10 @@ Python + numpy (carver.py / gpu_grid.py) with a GLSL raymarching renderer
 VoxelRenderer) require an active GL context and are therefore created lazily
 after the viewport's initializeGL fires.
 
+AppSettings.sim_backend == "dexel" swaps in the tri-dexel model (sim/dexel:
+GpuDexelGrid, DexelCarver, DexelRenderer, dexel collision check) behind the
+same VoxelSimController and pre-pass; everything else here is shared.
+
 Public interface (mirrors SimPlaceholder so machine_page.py can swap freely):
     set_file(path)              — load and compile a G-code file
     set_mode("SIM"|"MACHINE")  — sim player vs. live machine follow
@@ -57,6 +61,12 @@ try:
     from controller.sim.voxel.renderer   import VoxelRenderer
     from controller.sim.voxel.collision  import CollisionHit
     from controller.sim.voxel.prepass    import CollisionPrepassResult, run_prepass
+    # Tri-dexel backend (AppSettings.sim_backend == "dexel") — same deps.
+    from controller.sim.dexel.stock      import solid_dexels
+    from controller.sim.dexel.gpu_fields import GpuDexelGrid
+    from controller.sim.dexel.carver     import DexelCarver
+    from controller.sim.dexel.collision  import check_segment as dexel_check_segment
+    from controller.sim.dexel.renderer   import DexelRenderer
     _VOXEL_AVAILABLE = True
 except ImportError:
     _VOXEL_AVAILABLE = False
@@ -260,6 +270,7 @@ class DatumSimWidget(QWidget):
             lambda name: self.set_path_mode(self._PATH_MAP.get(name, PathMode.PROGRESSIVE)))
 
         s.voxel_size_changed.connect(self._on_voxel_size_changed)
+        s.sim_backend_changed.connect(self._on_sim_backend_changed)
         s.voxel_enabled_changed.connect(self._on_voxel_enabled_changed)
         # Rebuild the sim whenever stock geometry settings change
         s.stock_shape_changed.connect(self._on_stock_settings_changed)
@@ -473,6 +484,7 @@ class DatumSimWidget(QWidget):
             else get_tool_by_pocket(1)
         )
         db = ToolDatabase.instance()
+        backend = s.sim_backend
 
         my_abort = threading.Event()
         self._prepass_abort = my_abort
@@ -482,6 +494,7 @@ class DatumSimWidget(QWidget):
             result = run_prepass(
                 path, tool_changes, initial_tool, stock,
                 get_tool_by_pocket=get_tool_by_pocket, get_holder=db.get_holder, abort=my_abort,
+                backend=backend,
             )
             if not my_abort.is_set():
                 self._prepass_done.emit(gen, result)
@@ -574,9 +587,12 @@ class DatumSimWidget(QWidget):
             y_offset_mm     = s.stock_y_offset_mm,
         )
         stock.build_bbox(self._last_program.path)
+        # The "material" handed over is the backend's CPU stock: a uint8
+        # voxel array or a DexelStock — _create_voxel_sim() dispatches on it.
+        build = solid_dexels if s.sim_backend == "dexel" else solid_material
 
         def _worker() -> None:
-            material = solid_material(stock)
+            material = build(stock)
             if not my_abort.is_set():
                 self._voxel_material_ready.emit(gen, stock, material)
 
@@ -625,8 +641,17 @@ class DatumSimWidget(QWidget):
 
         self.viewport.makeCurrent()
         try:
-            grid  = GpuVoxelGrid(self.viewport.ctx, stock, material=material)
-            carver = VoxelCarver(grid)
+            checker = None
+            if isinstance(material, np.ndarray):
+                grid   = GpuVoxelGrid(self.viewport.ctx, stock, material=material)
+                carver = VoxelCarver(grid)
+            else:
+                grid   = GpuDexelGrid(self.viewport.ctx, stock, dexels=material)
+                carver = DexelCarver(grid.dexels)
+                dexels = grid.dexels
+
+                def checker(start, end, tool, is_rapid, holder):
+                    return dexel_check_segment(dexels, start, end, tool, is_rapid, holder)
 
             active_tool = self._current_tool or get_tool_by_pocket(1)
             self._voxel_ctrl = VoxelSimController(
@@ -637,6 +662,7 @@ class DatumSimWidget(QWidget):
                 path_feed_rates  = self._last_program.path.feed_rates,
                 tool             = active_tool,
                 path_line_ids    = self._last_program.path.line_ids,
+                checker          = checker,
             )
             self._voxel_ctrl.set_collision_enabled(self._effective_collision_enabled())
             if active_tool is not None:
@@ -651,7 +677,8 @@ class DatumSimWidget(QWidget):
             self._voxel_ctrl.set_prepass(self._prepass_result)
             self._collision_active = False
 
-            self._voxel_renderer = VoxelRenderer(self.viewport.ctx, grid)
+            renderer_cls = VoxelRenderer if isinstance(grid, GpuVoxelGrid) else DexelRenderer
+            self._voxel_renderer = renderer_cls(self.viewport.ctx, grid)
         finally:
             self.viewport.doneCurrent()
 
@@ -684,13 +711,18 @@ class DatumSimWidget(QWidget):
         self._carve_done.clear()
         self._carve_thread = None
 
+        grid = self._voxel_ctrl.grid if self._voxel_ctrl is not None else None
         self._voxel_ctrl = None          # carving stops immediately
 
-        if self._voxel_renderer is not None:
-            # Release GPU shader objects
+        if self._voxel_renderer is not None or grid is not None:
+            # Release GPU shader objects and the material texture(s) — the
+            # latter can be hundreds of MB at a fine resolution.
             self.viewport.makeCurrent()
             try:
-                self._voxel_renderer.release()
+                if self._voxel_renderer is not None:
+                    self._voxel_renderer.release()
+                if grid is not None:
+                    grid.release()
             finally:
                 self.viewport.doneCurrent()
             self._voxel_renderer = None
@@ -722,6 +754,11 @@ class DatumSimWidget(QWidget):
         # The pre-pass sampled against the old voxel resolution — recompute
         # against the new one (see _invalidate_prepass()).
         self._invalidate_prepass()
+
+    def _on_sim_backend_changed(self, _backend: str) -> None:
+        """Voxel ↔ tri-dexel switched → rebuild exactly like a resolution
+        change: new stock model, and a pre-pass against that model."""
+        self._on_voxel_size_changed(AppSettings.instance().voxel_size)
 
     def _on_voxel_enabled_changed(self, enabled: bool) -> None:
         """Voxel enable/disable checkbox toggled."""

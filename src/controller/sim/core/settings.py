@@ -44,6 +44,7 @@ class AppSettings(QObject):
     voxel_size_changed    = Signal(float)
     voxel_enabled_changed = Signal(bool)
     voxel_color_changed   = Signal(str)
+    sim_backend_changed   = Signal(str)
 
     tool_cutting_color_changed = Signal(str)
 
@@ -329,6 +330,22 @@ class AppSettings(QObject):
         v = float(max(0.05, v))   # prevent accidentally tiny grids
         self._qs.setValue("sim/voxel_size", v)
         self.voxel_size_changed.emit(v)
+
+    SIM_BACKENDS: tuple[str, ...] = ("voxel", "dexel")
+
+    @property
+    def sim_backend(self) -> str:
+        """Material-removal model: "voxel" (dense grid, sim/voxel) or
+        "dexel" (tri-dexel rays, sim/dexel). Default "voxel"."""
+        v = self._qs.value("sim/backend", "voxel", type=str)
+        return v if v in self.SIM_BACKENDS else "voxel"
+
+    @sim_backend.setter
+    def sim_backend(self, v: str) -> None:
+        if v not in self.SIM_BACKENDS:
+            v = "voxel"
+        self._qs.setValue("sim/backend", v)
+        self.sim_backend_changed.emit(v)
 
     @property
     def voxel_enabled(self) -> bool:
