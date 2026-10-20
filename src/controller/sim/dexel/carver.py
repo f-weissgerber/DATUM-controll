@@ -57,7 +57,5 @@ class DexelCarver:
                 res = sweep_z(field, start, end, self._inverse(tool, cut_len), 0.0, cut_len)
             else:
                 res = sweep_horizontal(field, start, end, radius_at, tool.radius, 0.0, cut_len)
-            if res is None:
-                continue
-            (iv0, iv1, iu0, iu1), lo, hi = res
-            field.subtract(iv0, iv1, iu0, iu1, lo, hi)
+            if res is not None:
+                field.subtract_rays(*res)

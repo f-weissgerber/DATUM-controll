@@ -193,24 +193,23 @@ def _check_monotone(
     res = sweep_z(f, start, end, inv, z_check_lo, full_len)
     if res is None:
         return None
-    (iv0, iv1, iu0, iu1), lo, hi = res
-    s = f.start[iv0:iv1, iu0:iu1]
-    e = f.end[iv0:iv1, iu0:iu1]
-    lo_ = lo[..., np.newaxis] + CONTACT_TOL
-    hi_ = hi[..., np.newaxis] - CONTACT_TOL
-    overlap = (s < hi_) & (e > lo_)                          # (lv, lu, K)
-    ray_hit = overlap.any(axis=-1) & (lo < hi)
+    rv, ru, lo, hi = res                                      # rays in row-major order
+    s = f.start[rv, ru]                                       # (n, K)
+    e = f.end[rv, ru]
+    overlap = (s < (hi - CONTACT_TOL)[:, np.newaxis]) & (e > (lo + CONTACT_TOL)[:, np.newaxis])
+    ray_hit = overlap.any(axis=1)
     if not ray_hit.any():
         return None
 
     # Report the colliding ray nearest the segment start (the voxel check
     # reports the first hit along the move as well).
-    hv, hu = np.nonzero(ray_hit)
-    xs = f.u_centers(iu0, iu1)[hu]
-    ys = f.v_centers(iv0, iv1)[hv]
+    hit_idx = np.nonzero(ray_hit)[0]
+    xs = f.origin[f.u_axis] + (ru[hit_idx].astype("f4") + 0.5) * f.h
+    ys = f.origin[f.v_axis] + (rv[hit_idx].astype("f4") + 0.5) * f.h
     i = int(np.argmin((xs - start[0]) ** 2 + (ys - start[1]) ** 2))
-    k = int(np.argmax(overlap[hv[i], hu[i]]))
-    z = max(float(lo[hv[i], hu[i]]), float(s[hv[i], hu[i], k]))
+    n = int(hit_idx[i])
+    k = int(np.argmax(overlap[n]))
+    z = max(float(lo[n]), float(s[n, k]))
     world_pt = np.array([xs[i], ys[i], z], dtype="f4")
 
     kind: Literal["rapid", "shank", "holder"]

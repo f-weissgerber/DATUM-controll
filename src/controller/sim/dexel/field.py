@@ -125,7 +125,18 @@ class DexelField:
         """Remove [lo, hi] from every ray of the block [iv0:iv1, iu0:iu1].
 
         *lo*/*hi* have shape (iv1-iv0, iu1-iu0); rays with lo >= hi are left
-        untouched. Fully vectorised over the rays that are actually cut.
+        untouched. Block-shaped front end of subtract_rays()."""
+        cut = lo < hi
+        if not cut.any():
+            return
+        rv, ru = np.nonzero(cut)
+        self.subtract_rays(rv + iv0, ru + iu0, lo[cut], hi[cut])
+
+    def subtract_rays(
+        self, rv: np.ndarray, ru: np.ndarray, lo: np.ndarray, hi: np.ndarray,
+    ) -> None:
+        """Remove [lo[i], hi[i]] from ray (rv[i], ru[i]) — the compact form
+        sweep.py produces. Fully vectorised over the rays that are cut.
 
         Each slot (s, e) yields a left piece (s, min(e, lo)) and a right
         piece (max(s, hi), e). Slots are sorted and disjoint, so the valid
@@ -138,23 +149,19 @@ class DexelField:
         """
         # Only rays whose material actually overlaps (lo, hi) change — on a
         # real program most swept rays pass through already-cleared air.
-        blk_s = self.start[iv0:iv1, iu0:iu1]
-        blk_e = self.end[iv0:iv1, iu0:iu1]
-        cut = (lo < hi) & (
-            (blk_s < hi[..., np.newaxis]) & (blk_e > lo[..., np.newaxis])
-        ).any(axis=-1)
+        s_full = self.start[rv, ru]                  # (n, K)
+        e_full = self.end[rv, ru]
+        cut = ((s_full < hi[:, np.newaxis]) & (e_full > lo[:, np.newaxis])).any(axis=1)
         if not cut.any():
             return
-        rv, ru = np.nonzero(cut)
-        rv += iv0
-        ru += iu0
-        lo_ = lo[cut][:, np.newaxis]
-        hi_ = hi[cut][:, np.newaxis]
+        if not cut.all():
+            rv, ru, lo, hi = rv[cut], ru[cut], lo[cut], hi[cut]
+            s_full, e_full = s_full[cut], e_full[cut]
+        lo_ = lo[:, np.newaxis]
+        hi_ = hi[:, np.newaxis]
 
         # Used slots are a prefix, so only the first k = (most used) + 1
         # slots can change — typically 2–3 of the X/Y fields' 8.
-        s_full = self.start[rv, ru]                  # (n, K)
-        e_full = self.end[rv, ru]
         k_full = self.k
         k = min(k_full, int(np.count_nonzero(s_full <= e_full, axis=1).max()) + 1)
         s = s_full[:, :k]

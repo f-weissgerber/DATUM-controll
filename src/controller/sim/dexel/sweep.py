@@ -125,6 +125,22 @@ def _has_material_in(
     return ((s < hi) & (e > lo)).any(axis=-1)
 
 
+RaySweep = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+
+
+def _compact(rv: np.ndarray, ru: np.ndarray, lo: np.ndarray, hi: np.ndarray) -> RaySweep | None:
+    """(rv, ru, lo, hi) of the rays actually hit (lo < hi): absolute ray
+    indices + float32 interval — None if none. A compact list instead of
+    block-shaped arrays: the carver and the collision check only ever touch
+    these rays."""
+    lo = lo.astype("f4")
+    hi = hi.astype("f4")
+    ok = lo < hi
+    if not ok.any():
+        return None
+    return rv[ok], ru[ok], lo[ok], hi[ok]
+
+
 def _linear_range(p0: float, dp: float, lo, hi) -> tuple[np.ndarray, np.ndarray]:
     """t-range in which p0 + t·dp ∈ [lo, hi] (arrays allowed), unclipped."""
     if abs(dp) < _EPS:
@@ -142,13 +158,13 @@ def sweep_z(
     inv:      ProfileInverse,
     z_lo_rel: float,
     z_hi_rel: float,
-) -> tuple[tuple[int, int, int, int], np.ndarray, np.ndarray] | None:
+) -> RaySweep | None:
     """Swept interval along every Z ray the tool reaches.
 
     At XY distance d from its axis the tool occupies heights
     [tip + max(zmin(d), z_lo_rel), tip + z_hi_rel]. Reachable range: the t
-    with |q − p_xy(t)| ≤ r_max (quadratic in t). Returns
-    ((iv0, iv1, iu0, iu1), lo, hi) or None if no ray is hit.
+    with |q − p_xy(t)| ≤ r_max (quadratic in t). Returns the hit rays as
+    (rv, ru, lo, hi) (see _compact()) or None.
     """
     a = np.asarray(start, "f8")
     b = np.asarray(end, "f8")
@@ -201,13 +217,9 @@ def sweep_z(
     tz = (a[2] + ts * v[2]).astype("f4")
     zrel = np.maximum(inv.zmin(d), np.float32(z_lo_rel))
     hit = zrel <= z_hi_rel
-    lo = np.full(reach.shape, _NO_HIT_LO, dtype="f4")
-    hi = np.full(reach.shape, _NO_HIT_HI, dtype="f4")
-    lo[iv, iu] = np.where(hit, tz + zrel, _NO_HIT_LO).min(axis=-1)
-    hi[iv, iu] = np.where(hit, tz + np.float32(z_hi_rel), _NO_HIT_HI).max(axis=-1)
-    if not (lo < hi).any():
-        return None
-    return (iv0, iv1, iu0, iu1), lo.astype("f4"), hi.astype("f4")
+    lo = np.where(hit, tz + zrel, _NO_HIT_LO).min(axis=-1)
+    hi = np.where(hit, tz + np.float32(z_hi_rel), _NO_HIT_HI).max(axis=-1)
+    return _compact(iv + iv0, iu + iu0, lo, hi)
 
 
 def sweep_horizontal(
@@ -218,7 +230,7 @@ def sweep_horizontal(
     r_max:    float,
     z_lo_rel: float,
     z_hi_rel: float,
-) -> tuple[tuple[int, int, int, int], np.ndarray, np.ndarray] | None:
+) -> RaySweep | None:
     """Swept interval along every X ray (field.axis 0) or Y ray (axis 1).
 
     Ray (iv, iu) sits at height z = v and at the other horizontal coordinate
@@ -249,8 +261,6 @@ def sweep_horizontal(
     if not reach.any():
         return None
     iv, iu = np.nonzero(reach)
-    lo = np.full(reach.shape, _NO_HIT_LO, dtype="f4")
-    hi = np.full(reach.shape, _NO_HIT_HI, dtype="f4")
 
     if abs(v[2]) < _EPS:
         # Level move: at a ray's height the tool is a disc of fixed radius
@@ -277,11 +287,8 @@ def sweep_horizontal(
                 ok = (tt >= 0.0) & (tt <= 1.0)
                 cands_lo.append(np.where(ok, x, np.inf))
                 cands_hi.append(np.where(ok, x, -np.inf))
-        lo_r = np.min(cands_lo, axis=0)
-        hi_r = np.max(cands_hi, axis=0)
-        hit = lo_r <= hi_r
-        lo[iv, iu] = np.where(hit, lo_r, _NO_HIT_LO)
-        hi[iv, iu] = np.where(hit, hi_r, _NO_HIT_HI)
+        lo = np.min(cands_lo, axis=0)
+        hi = np.max(cands_hi, axis=0)
     else:
         if abs(v[ua]) < _EPS:
             t_star = np.zeros(len(iv))
@@ -296,8 +303,6 @@ def sweep_horizontal(
         hit = (q >= 0.0) & in_z
         half = np.sqrt(np.maximum(q, 0.0))
         t_ax = a[ax] + ts * v[ax]
-        lo[iv, iu] = np.where(hit, t_ax - half, _NO_HIT_LO).min(axis=-1)
-        hi[iv, iu] = np.where(hit, t_ax + half, _NO_HIT_HI).max(axis=-1)
-    if not (lo < hi).any():
-        return None
-    return (iv0, iv1, iu0, iu1), lo.astype("f4"), hi.astype("f4")
+        lo = np.where(hit, t_ax - half, _NO_HIT_LO).min(axis=-1)
+        hi = np.where(hit, t_ax + half, _NO_HIT_HI).max(axis=-1)
+    return _compact(iv + iv0, iu + iu0, lo, hi)
