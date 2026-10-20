@@ -21,6 +21,10 @@ carver      — DexelCarver: same carve_segment() interface as VoxelCarver
 collision   — check_segment() with the same rule as voxel/collision.py
 gpu_fields  — GpuDexelGrid: DexelStock + ModernGL texture arrays
 renderer    — DexelRenderer: GLSL ray casting, Blinn-Phong shading
+grouping    — collinear runs of tessellated segments (processed as one move)
+prepass     — collision pre-pass (Z rays only, runs as exact filters)
+_kernels    — optional numba kernels (pip install .[fast]); bit-identical
+              to the numpy paths, which remain the fallback
 
 Known limits
 ------------
