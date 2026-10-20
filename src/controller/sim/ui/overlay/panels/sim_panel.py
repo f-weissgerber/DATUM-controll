@@ -377,6 +377,11 @@ class _AppearanceTab(QWidget):
 # Section 3 — Simulation
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Keys match AppSettings.SIM_BACKENDS; labels are what the combo shows.
+_BACKEND_KEYS   = ["voxel", "dexel"]
+_BACKEND_LABELS = ["Voxel", "Tri-Dexel"]
+
+
 class _VoxelSimTab(QWidget):
     """Voxel simulation enable switch and resolution."""
 
@@ -399,6 +404,18 @@ class _VoxelSimTab(QWidget):
             )
         form.addRow("Aktivieren", self._chk)
 
+        self._backend_combo = QComboBox()
+        self._backend_combo.addItems(_BACKEND_LABELS)
+        self._backend_combo.setToolTip(
+            "Materialmodell der Abtragssimulation.\n"
+            "Voxel: dichtes Würfelgitter, in allen Richtungen auf die Auflösung gerastert.\n"
+            "Tri-Dexel: Strahlen in X/Y/Z mit exakten Materialgrenzen entlang\n"
+            "jedes Strahls — glattere Flächen, deutlich weniger Speicher bei\n"
+            "feiner Auflösung.\n"
+            "Änderung baut die Simulation sofort neu auf."
+        )
+        form.addRow("Modell", self._backend_combo)
+
         if not _VOXEL_AVAILABLE:
             warn = QLabel("⚠ Voxel-Module nicht verfügbar")
             warn.setStyleSheet("color: #e0a040; font-size: 11px;")
@@ -411,11 +428,11 @@ class _VoxelSimTab(QWidget):
         self._size_spin.setDecimals(2)
         self._size_spin.setSuffix(" mm")
         self._size_spin.setToolTip(
-            "Kantenlänge eines Voxels.\n"
+            "Kantenlänge eines Voxels bzw. Strahlabstand (Tri-Dexel).\n"
             "Kleiner = feiner, aber mehr Speicher + langsamer.\n"
             "Änderung baut die Simulation sofort neu auf."
         )
-        form.addRow("Voxelgröße", self._size_spin)
+        form.addRow("Auflösung", self._size_spin)
         root.addLayout(form)
 
         root.addWidget(_hdr("Sicherheit"))
@@ -449,6 +466,9 @@ class _VoxelSimTab(QWidget):
         self._chk.setChecked(s.voxel_enabled and _VOXEL_AVAILABLE)
         self._chk.blockSignals(False)
         _sync_spin(self._size_spin, s.voxel_size)
+        self._backend_combo.blockSignals(True)
+        self._backend_combo.setCurrentIndex(_BACKEND_KEYS.index(s.sim_backend))
+        self._backend_combo.blockSignals(False)
         self._sync_size_state()
         self._chk_collision.blockSignals(True)
         self._chk_collision.setChecked(s.collision_detection_enabled)
@@ -458,6 +478,7 @@ class _VoxelSimTab(QWidget):
         # Write side
         self._chk.toggled.connect(self._on_enabled)
         self._size_spin.valueChanged.connect(lambda v: setattr(s, "voxel_size", v))
+        self._backend_combo.currentIndexChanged.connect(self._on_backend)
         self._chk_collision.toggled.connect(
             lambda v: setattr(s, "collision_detection_enabled", v))
         self._safe_z_spin.valueChanged.connect(lambda v: setattr(s, "start_safe_z_mm", v))
@@ -467,11 +488,24 @@ class _VoxelSimTab(QWidget):
         # with a libshiboken "already deleted" RuntimeError before this fix).
         s.voxel_enabled_changed.connect(self._on_enabled_changed)
         s.voxel_size_changed.connect(self._on_voxel_size_settings_changed)
+        s.sim_backend_changed.connect(self._on_backend_settings_changed)
         s.collision_detection_enabled_changed.connect(self._on_collision_settings_changed)
         s.start_safe_z_mm_changed.connect(self._on_safe_z_settings_changed)
 
     def _sync_size_state(self) -> None:
-        self._size_spin.setEnabled(_VOXEL_AVAILABLE and self._chk.isChecked())
+        on = _VOXEL_AVAILABLE and self._chk.isChecked()
+        self._size_spin.setEnabled(on)
+        self._backend_combo.setEnabled(on)
+
+    def _on_backend(self, idx: int) -> None:
+        self._s.sim_backend = _BACKEND_KEYS[idx]
+
+    def _on_backend_settings_changed(self, key: str) -> None:
+        idx = _BACKEND_KEYS.index(key) if key in _BACKEND_KEYS else 0
+        if idx != self._backend_combo.currentIndex():
+            self._backend_combo.blockSignals(True)
+            self._backend_combo.setCurrentIndex(idx)
+            self._backend_combo.blockSignals(False)
 
     def _on_enabled(self, checked: bool) -> None:
         self._s.voxel_enabled = checked

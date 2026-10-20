@@ -97,6 +97,7 @@ def run_prepass(
     get_tool_by_pocket,
     get_holder,
     abort:        threading.Event | None = None,
+    backend:      str = "voxel",
 ) -> CollisionPrepassResult | None:
     """Scan the whole *path* for collisions against a fresh scratch stock.
 
@@ -109,13 +110,33 @@ def run_prepass(
     gcode/compiler.py's ToolChange docstring) — the caller
     (DatumSimWidget._start_prepass()) passes tool_database.get_tool_by_pocket.
 
+    *backend* selects the scratch stock the scan replays against:
+    "voxel" (default) or "dexel" (tri-dexel, see sim/dexel) — so the table
+    always matches the geometry the live simulation actually carves.
+
     Returns None if *abort* is set before the scan completes (the caller
     started a newer pre-pass and this one's result no longer applies — see
     DatumSimWidget._start_prepass()'s generation-counter race guard).
     """
-    material = solid_material(stock)
-    bbox, voxel_size = stock.bbox, stock.voxel_size
-    carver = VoxelCarver(_CpuMaterialSink(material, bbox, voxel_size))
+    if backend == "dexel":
+        from controller.sim.dexel.carver import DexelCarver
+        from controller.sim.dexel.collision import check_segment as dexel_check
+        from controller.sim.dexel.stock import solid_dexels
+
+        dexels = solid_dexels(stock)
+        carver = DexelCarver(dexels)
+
+        def check(start, end, tool, is_rapid, holder):
+            return dexel_check(dexels, start, end, tool, is_rapid, holder)
+    else:
+        material = solid_material(stock)
+        bbox, voxel_size = stock.bbox, stock.voxel_size
+        carver = VoxelCarver(_CpuMaterialSink(material, bbox, voxel_size))
+
+        def check(start, end, tool, is_rapid, holder):
+            return check_segment(
+                material, bbox, voxel_size, start, end, tool, is_rapid, holder,
+            )
 
     pts, feeds, line_ids = path.points, path.feed_rates, path.line_ids
     # Vectorized once, outside the loop — a 1:1 restatement of the per-
@@ -155,10 +176,7 @@ def run_prepass(
             continue
 
         is_rapid = bool(is_rapid_arr[i])
-        hit = check_segment(
-            material, bbox, voxel_size, pts[i], pts[i + 1],
-            current_tool, is_rapid, current_holder,
-        )
+        hit = check(pts[i], pts[i + 1], current_tool, is_rapid, current_holder)
         if hit is not None:
             hit.line_number = int(line_ids[i + 1])
             hits_by_segment[i] = hit
