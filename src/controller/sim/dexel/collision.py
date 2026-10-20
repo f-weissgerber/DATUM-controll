@@ -98,6 +98,23 @@ def check_segment(
     if full_len <= z_check_lo:
         return None
 
+    max_r = tool.radius
+    if holder is not None and holder.profile:
+        max_r = max(max_r, max(r for _, r in holder.profile))
+
+    # Height pre-filter: if every material interval in the move's footprint
+    # ends strictly below the lowest checked height, nothing can collide —
+    # the common case for rapids at safe height (~80 % of check calls on
+    # workpieces/Gcode.cnc). Exact for both paths below: they only look at
+    # rays within max_r and heights >= tip + z_check_lo.
+    f = dexels.z_field
+    iu0, iu1 = f.index_range(min(start[0], end[0]) - max_r, max(start[0], end[0]) + max_r, 0)
+    iv0, iv1 = f.index_range(min(start[1], end[1]) - max_r, max(start[1], end[1]) + max_r, 1)
+    if iu0 >= iu1 or iv0 >= iv1:
+        return None
+    if float(f.end[iv0:iv1, iu0:iu1].max()) < min(float(start[2]), float(end[2])) + z_check_lo:
+        return None
+
     inv = _outline_inverse(tool, holder, total_len, z_check_lo, full_len)
     if inv is not None:
         return _check_monotone(
@@ -106,11 +123,6 @@ def check_segment(
 
     pts = stamp_points(start, end, vs, full_len - z_check_lo)
 
-    max_r = tool.radius
-    if holder is not None and holder.profile:
-        max_r = max(max_r, max(r for _, r in holder.profile))
-
-    f = dexels.z_field
     iu0, iu1 = f.index_range(pts[:, 0].min() - max_r, pts[:, 0].max() + max_r, 0)
     iv0, iv1 = f.index_range(pts[:, 1].min() - max_r, pts[:, 1].max() + max_r, 1)
     if iu0 >= iu1 or iv0 >= iv1:
