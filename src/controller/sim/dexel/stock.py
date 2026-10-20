@@ -30,13 +30,19 @@ DEFAULT_K_XY: int = 8
 
 
 class DexelStock:
-    """Three DexelFields (index 0/1/2 = rays along X/Y/Z) + stock geometry."""
+    """Three DexelFields (index 0/1/2 = rays along X/Y/Z) + stock geometry.
+
+    *axes* limits which ray sets exist; the others are None. The collision
+    pre-pass only reads the Z rays (collision.py), so its scratch stock is
+    built with axes=(2,) and never pays for carving X/Y.
+    """
 
     def __init__(
         self,
         stock: StockDefinition,
         k_xy:  int = DEFAULT_K_XY,
         k_z:   int = DEFAULT_K_Z,
+        axes:  tuple[int, ...] = (0, 1, 2),
     ) -> None:
         if stock.bbox is None:
             raise RuntimeError("Call stock.build_bbox(path) before building a DexelStock")
@@ -49,13 +55,13 @@ class DexelStock:
         origin = self.bbox.origin()
         h = self.voxel_size
         dims = (nx, ny, nz)
-        self.fields: tuple[DexelField, DexelField, DexelField] = tuple(  # type: ignore[assignment]
+        self.fields: tuple[DexelField | None, DexelField | None, DexelField | None] = tuple(  # type: ignore[assignment]
             DexelField(
                 axis, origin, h,
                 nu=dims[PLANE_AXES[axis][0]],
                 nv=dims[PLANE_AXES[axis][1]],
                 k=k_z if axis == 2 else k_xy,
-            )
+            ) if axis in axes else None
             for axis in (0, 1, 2)
         )
         self.reset()
@@ -68,6 +74,8 @@ class DexelStock:
         lo = (b.x_min, b.y_min, b.z_min)
         hi = (b.x_max, b.y_max, b.z_max)
         for f in self.fields:
+            if f is None:
+                continue
             u = f.u_centers()[np.newaxis, :]     # (1, Nu)
             v = f.v_centers()[:, np.newaxis]     # (Nv, 1)
             start = np.full((f.nv, f.nu), lo[f.axis], dtype="f4")
@@ -117,11 +125,11 @@ class DexelStock:
 
     @property
     def is_dirty(self) -> bool:
-        return any(f.is_dirty for f in self.fields)
+        return any(f.is_dirty for f in self.fields if f is not None)
 
 
-def solid_dexels(stock: StockDefinition) -> DexelStock:
+def solid_dexels(stock: StockDefinition, axes: tuple[int, ...] = (0, 1, 2)) -> DexelStock:
     """Dexel counterpart of gpu_grid.solid_material(): a fresh, fully solid
     DexelStock for *stock* (bbox must be set). GL-free — call it from a
     background thread."""
-    return DexelStock(stock)
+    return DexelStock(stock, axes=axes)

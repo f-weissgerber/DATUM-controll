@@ -19,6 +19,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Optional JIT kernels for the tri-dexel simulation (sim/dexel/_kernels.py);
+# without numba the bit-identical numpy paths are used.
+fast = [
+    "numba>=0.68.0",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-qt>=4.4.0",

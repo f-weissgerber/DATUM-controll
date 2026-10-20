@@ -30,12 +30,16 @@ from __future__ import annotations
 
 import numpy as np
 
+from controller.sim.dexel import _kernels
 from controller.sim.dexel.field import DexelField
 from controller.sim.simulation.tool_definition import ToolDefinition
 
 # Evenly spaced evaluation points inside each ray's reachable t-range, on
 # top of its two ends and the closest-approach point.
 N_SAMPLES = 16
+
+# Sample fractions for 3-D moves (the numba kernels get the same array).
+_FRAC = np.linspace(0.0, 1.0, N_SAMPLES, dtype="f8")
 
 _NO_HIT_LO = np.float32(1.0e30)
 _NO_HIT_HI = np.float32(-1.0e30)
@@ -125,6 +129,31 @@ def _has_material_in(
     return ((s < hi) & (e > lo)).any(axis=-1)
 
 
+RaySweep = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+
+
+def _compact(rv: np.ndarray, ru: np.ndarray, lo: np.ndarray, hi: np.ndarray) -> RaySweep | None:
+    """(rv, ru, lo, hi) of the rays actually hit (lo < hi): absolute ray
+    indices + float32 interval — None if none. A compact list instead of
+    block-shaped arrays: the carver and the collision check only ever touch
+    these rays."""
+    lo = lo.astype("f4")
+    hi = hi.astype("f4")
+    ok = lo < hi
+    if not ok.any():
+        return None
+    return rv[ok], ru[ok], lo[ok], hi[ok]
+
+
+def _compact_block(iv0: int, iu0: int, lo: np.ndarray, hi: np.ndarray) -> RaySweep | None:
+    """_compact() for the numba kernels' block output (row-major, like the
+    numpy paths' np.nonzero order)."""
+    rv, ru = np.nonzero(lo < hi)
+    if len(rv) == 0:
+        return None
+    return rv + iv0, ru + iu0, lo[rv, ru], hi[rv, ru]
+
+
 def _linear_range(p0: float, dp: float, lo, hi) -> tuple[np.ndarray, np.ndarray]:
     """t-range in which p0 + t·dp ∈ [lo, hi] (arrays allowed), unclipped."""
     if abs(dp) < _EPS:
@@ -142,13 +171,13 @@ def sweep_z(
     inv:      ProfileInverse,
     z_lo_rel: float,
     z_hi_rel: float,
-) -> tuple[tuple[int, int, int, int], np.ndarray, np.ndarray] | None:
+) -> RaySweep | None:
     """Swept interval along every Z ray the tool reaches.
 
     At XY distance d from its axis the tool occupies heights
     [tip + max(zmin(d), z_lo_rel), tip + z_hi_rel]. Reachable range: the t
-    with |q − p_xy(t)| ≤ r_max (quadratic in t). Returns
-    ((iv0, iv1, iu0, iu1), lo, hi) or None if no ray is hit.
+    with |q − p_xy(t)| ≤ r_max (quadratic in t). Returns the hit rays as
+    (rv, ru, lo, hi) (see _compact()) or None.
     """
     a = np.asarray(start, "f8")
     b = np.asarray(end, "f8")
@@ -158,6 +187,19 @@ def sweep_z(
     iv0, iv1 = field.index_range(min(a[1], b[1]) - rmax, max(a[1], b[1]) + rmax, 1)
     if iu0 >= iu1 or iv0 >= iv1:
         return None
+    if _kernels.HAVE_NUMBA:
+        out_lo = np.empty((iv1 - iv0, iu1 - iu0), dtype="f4")
+        out_hi = np.empty_like(out_lo)
+        exact = abs(v[2]) < _EPS or (v[0] * v[0] + v[1] * v[1]) < _EPS
+        _kernels.sweep_z_kernel(
+            field.start, field.end, iv0, iu0,
+            field.u_centers(iu0, iu1), field.v_centers(iv0, iv1), a, b, float(rmax),
+            inv.r, inv.hz, float(z_lo_rel), float(z_hi_rel),
+            float(min(a[2], b[2]) + z_lo_rel), float(max(a[2], b[2]) + z_hi_rel),
+            exact, _FRAC, _EPS, _NO_HIT_LO, _NO_HIT_HI, out_lo, out_hi,
+        )
+        return _compact_block(iv0, iu0, out_lo, out_hi)
+
     qx = field.u_centers(iu0, iu1).astype("f8")[np.newaxis, :] - a[0]   # (1, lu)
     qy = field.v_centers(iv0, iv1).astype("f8")[:, np.newaxis] - a[1]   # (lv, 1)
 
@@ -201,13 +243,9 @@ def sweep_z(
     tz = (a[2] + ts * v[2]).astype("f4")
     zrel = np.maximum(inv.zmin(d), np.float32(z_lo_rel))
     hit = zrel <= z_hi_rel
-    lo = np.full(reach.shape, _NO_HIT_LO, dtype="f4")
-    hi = np.full(reach.shape, _NO_HIT_HI, dtype="f4")
-    lo[iv, iu] = np.where(hit, tz + zrel, _NO_HIT_LO).min(axis=-1)
-    hi[iv, iu] = np.where(hit, tz + np.float32(z_hi_rel), _NO_HIT_HI).max(axis=-1)
-    if not (lo < hi).any():
-        return None
-    return (iv0, iv1, iu0, iu1), lo.astype("f4"), hi.astype("f4")
+    lo = np.where(hit, tz + zrel, _NO_HIT_LO).min(axis=-1)
+    hi = np.where(hit, tz + np.float32(z_hi_rel), _NO_HIT_HI).max(axis=-1)
+    return _compact(iv + iv0, iu + iu0, lo, hi)
 
 
 def sweep_horizontal(
@@ -218,7 +256,7 @@ def sweep_horizontal(
     r_max:    float,
     z_lo_rel: float,
     z_hi_rel: float,
-) -> tuple[tuple[int, int, int, int], np.ndarray, np.ndarray] | None:
+) -> RaySweep | None:
     """Swept interval along every X ray (field.axis 0) or Y ray (axis 1).
 
     Ray (iv, iu) sits at height z = v and at the other horizontal coordinate
@@ -236,6 +274,24 @@ def sweep_horizontal(
     )
     if iu0 >= iu1 or iv0 >= iv1:
         return None
+    if _kernels.HAVE_NUMBA and abs(v[2]) < _EPS:
+        zs_f4 = field.v_centers(iv0, iv1)
+        r_row = radius_at_array((zs_f4.astype("f8") - a[2]).astype("f4")).astype("f8")
+        has_band = abs(v[ua]) >= _EPS
+        n_ax = n_ua = 0.0
+        if has_band:
+            l_xy = float(np.hypot(v[ax], v[ua]))
+            n_ax, n_ua = float(-v[ua] / l_xy), float(v[ax] / l_xy)
+        out_lo = np.empty((iv1 - iv0, iu1 - iu0), dtype="f4")
+        out_hi = np.empty_like(out_lo)
+        _kernels.sweep_level_kernel(
+            field.start, field.end, iv0, iu0, field.u_centers(iu0, iu1), zs_f4, a, b,
+            ax, ua, float(r_max), float(z_lo_rel), float(z_hi_rel),
+            float(min(a[ax], b[ax]) - r_max), float(max(a[ax], b[ax]) + r_max),
+            r_row, has_band, n_ax, n_ua, _EPS, _NO_HIT_LO, _NO_HIT_HI, out_lo, out_hi,
+        )
+        return _compact_block(iv0, iu0, out_lo, out_hi)
+
     us = field.u_centers(iu0, iu1).astype("f8")[np.newaxis, :]    # (1, lu)
     zs = field.v_centers(iv0, iv1).astype("f8")[:, np.newaxis]    # (lv, 1)
 
@@ -249,8 +305,6 @@ def sweep_horizontal(
     if not reach.any():
         return None
     iv, iu = np.nonzero(reach)
-    lo = np.full(reach.shape, _NO_HIT_LO, dtype="f4")
-    hi = np.full(reach.shape, _NO_HIT_HI, dtype="f4")
 
     if abs(v[2]) < _EPS:
         # Level move: at a ray's height the tool is a disc of fixed radius
@@ -277,11 +331,8 @@ def sweep_horizontal(
                 ok = (tt >= 0.0) & (tt <= 1.0)
                 cands_lo.append(np.where(ok, x, np.inf))
                 cands_hi.append(np.where(ok, x, -np.inf))
-        lo_r = np.min(cands_lo, axis=0)
-        hi_r = np.max(cands_hi, axis=0)
-        hit = lo_r <= hi_r
-        lo[iv, iu] = np.where(hit, lo_r, _NO_HIT_LO)
-        hi[iv, iu] = np.where(hit, hi_r, _NO_HIT_HI)
+        lo = np.min(cands_lo, axis=0)
+        hi = np.max(cands_hi, axis=0)
     else:
         if abs(v[ua]) < _EPS:
             t_star = np.zeros(len(iv))
@@ -296,8 +347,6 @@ def sweep_horizontal(
         hit = (q >= 0.0) & in_z
         half = np.sqrt(np.maximum(q, 0.0))
         t_ax = a[ax] + ts * v[ax]
-        lo[iv, iu] = np.where(hit, t_ax - half, _NO_HIT_LO).min(axis=-1)
-        hi[iv, iu] = np.where(hit, t_ax + half, _NO_HIT_HI).max(axis=-1)
-    if not (lo < hi).any():
-        return None
-    return (iv0, iv1, iu0, iu1), lo.astype("f4"), hi.astype("f4")
+        lo = np.where(hit, t_ax - half, _NO_HIT_LO).min(axis=-1)
+        hi = np.where(hit, t_ax + half, _NO_HIT_HI).max(axis=-1)
+    return _compact(iv + iv0, iu + iu0, lo, hi)

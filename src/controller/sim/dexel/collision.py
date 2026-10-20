@@ -27,6 +27,7 @@ from typing import Literal
 
 import numpy as np
 
+from controller.sim.dexel import _kernels
 from controller.sim.dexel.stock import DexelStock
 from controller.sim.dexel.sweep import ProfileInverse, stamp_points, sweep_z
 from controller.sim.simulation.tool_definition import ToolDefinition
@@ -63,6 +64,26 @@ def _outline_inverse(
     return inv
 
 
+def _zone(tool: ToolDefinition, holder: HolderProfile | None, is_rapid: bool):
+    """(total_len, z_check_lo, full_len) — the checked height zone."""
+    total_len = tool.total_length if tool.total_length > 0.0 else (
+        tool.cutting_length if tool.cutting_length > 0.0 else 999.0
+    )
+    holder_len = holder.gauge_length if holder is not None else 0.0
+    return total_len, (0.0 if is_rapid else tool.cutting_length), total_len + holder_len
+
+
+def is_closed_form(
+    tool: ToolDefinition, holder: HolderProfile | None, is_rapid: bool,
+) -> bool:
+    """True if check_segment() takes the closed-form path for this tool —
+    the path whose result is monotone in the move (a sub-move's checked
+    volume lies inside the whole move's), which the pre-pass relies on to
+    use a whole collinear run's check as a filter for its pieces."""
+    total_len, z_lo, full_len = _zone(tool, holder, is_rapid)
+    return full_len <= z_lo or _outline_inverse(tool, holder, total_len, z_lo, full_len) is not None
+
+
 def check_segment(
     dexels:   DexelStock,
     start:    np.ndarray,
@@ -74,13 +95,25 @@ def check_segment(
     """Return the first collision of *tool* (+ *holder*) moving start→end,
     or None. See module docstring for the rule."""
     vs = dexels.voxel_size
-    total_len = tool.total_length if tool.total_length > 0.0 else (
-        tool.cutting_length if tool.cutting_length > 0.0 else 999.0
-    )
-    holder_len = holder.gauge_length if holder is not None else 0.0
-    full_len = total_len + holder_len
-    z_check_lo = 0.0 if is_rapid else tool.cutting_length
+    total_len, z_check_lo, full_len = _zone(tool, holder, is_rapid)
     if full_len <= z_check_lo:
+        return None
+
+    max_r = tool.radius
+    if holder is not None and holder.profile:
+        max_r = max(max_r, max(r for _, r in holder.profile))
+
+    # Height pre-filter: if every material interval in the move's footprint
+    # ends strictly below the lowest checked height, nothing can collide —
+    # the common case for rapids at safe height (~80 % of check calls on
+    # workpieces/Gcode.cnc). Exact for both paths below: they only look at
+    # rays within max_r and heights >= tip + z_check_lo.
+    f = dexels.z_field
+    iu0, iu1 = f.index_range(min(start[0], end[0]) - max_r, max(start[0], end[0]) + max_r, 0)
+    iv0, iv1 = f.index_range(min(start[1], end[1]) - max_r, max(start[1], end[1]) + max_r, 1)
+    if iu0 >= iu1 or iv0 >= iv1:
+        return None
+    if float(f.end[iv0:iv1, iu0:iu1].max()) < min(float(start[2]), float(end[2])) + z_check_lo:
         return None
 
     inv = _outline_inverse(tool, holder, total_len, z_check_lo, full_len)
@@ -91,11 +124,6 @@ def check_segment(
 
     pts = stamp_points(start, end, vs, full_len - z_check_lo)
 
-    max_r = tool.radius
-    if holder is not None and holder.profile:
-        max_r = max(max_r, max(r for _, r in holder.profile))
-
-    f = dexels.z_field
     iu0, iu1 = f.index_range(pts[:, 0].min() - max_r, pts[:, 0].max() + max_r, 0)
     iv0, iv1 = f.index_range(pts[:, 1].min() - max_r, pts[:, 1].max() + max_r, 1)
     if iu0 >= iu1 or iv0 >= iv1:
@@ -166,24 +194,31 @@ def _check_monotone(
     res = sweep_z(f, start, end, inv, z_check_lo, full_len)
     if res is None:
         return None
-    (iv0, iv1, iu0, iu1), lo, hi = res
-    s = f.start[iv0:iv1, iu0:iu1]
-    e = f.end[iv0:iv1, iu0:iu1]
-    lo_ = lo[..., np.newaxis] + CONTACT_TOL
-    hi_ = hi[..., np.newaxis] - CONTACT_TOL
-    overlap = (s < hi_) & (e > lo_)                          # (lv, lu, K)
-    ray_hit = overlap.any(axis=-1) & (lo < hi)
+    rv, ru, lo, hi = res                                      # rays in row-major order
+    lo_p = lo + CONTACT_TOL                                   # float32, both paths
+    hi_m = hi - CONTACT_TOL
+    if _kernels.HAVE_NUMBA:
+        first_slot = np.empty(len(rv), dtype=np.int64)
+        _kernels.overlap_rays_kernel(f.start, f.end, rv, ru, lo_p, hi_m, first_slot)
+        ray_hit = first_slot >= 0
+    else:
+        s = f.start[rv, ru]                                   # (n, K)
+        e = f.end[rv, ru]
+        overlap = (s < hi_m[:, np.newaxis]) & (e > lo_p[:, np.newaxis])
+        ray_hit = overlap.any(axis=1)
+        first_slot = np.argmax(overlap, axis=1)
     if not ray_hit.any():
         return None
 
     # Report the colliding ray nearest the segment start (the voxel check
     # reports the first hit along the move as well).
-    hv, hu = np.nonzero(ray_hit)
-    xs = f.u_centers(iu0, iu1)[hu]
-    ys = f.v_centers(iv0, iv1)[hv]
+    hit_idx = np.nonzero(ray_hit)[0]
+    xs = f.origin[f.u_axis] + (ru[hit_idx].astype("f4") + 0.5) * f.h
+    ys = f.origin[f.v_axis] + (rv[hit_idx].astype("f4") + 0.5) * f.h
     i = int(np.argmin((xs - start[0]) ** 2 + (ys - start[1]) ** 2))
-    k = int(np.argmax(overlap[hv[i], hu[i]]))
-    z = max(float(lo[hv[i], hu[i]]), float(s[hv[i], hu[i], k]))
+    n = int(hit_idx[i])
+    k = int(first_slot[n])
+    z = max(float(lo[n]), float(f.start[rv[n], ru[n], k]))
     world_pt = np.array([xs[i], ys[i], z], dtype="f4")
 
     kind: Literal["rapid", "shank", "holder"]

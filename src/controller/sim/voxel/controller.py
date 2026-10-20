@@ -101,6 +101,11 @@ class VoxelSimController:
         its DexelStock. *grid* and *carver* are duck-typed the same way
         (GpuDexelGrid / DexelCarver), so all High-Water-Mark and pre-pass
         logic here is shared by both backends.
+    run_ends :
+        Optional (N-1,) array from dexel/grouping.run_ends(): straight
+        collinear runs are then carved as one move (exact for the dexel
+        carver, see grouping.py). None (default, voxel) = one carve per
+        segment, as before.
     """
 
     def __init__(
@@ -113,9 +118,11 @@ class VoxelSimController:
         tool:             ToolDefinition,
         path_line_ids:    np.ndarray | None = None,
         checker:          Callable[..., CollisionHit | None] | None = None,
+        run_ends:         np.ndarray | None = None,
     ) -> None:
         self._grid            = grid
         self._checker         = checker
+        self._run_ends        = run_ends
         self._carver          = carver
         self._pts             = path_points       # (N, 3) float32
         self._arc             = path_arc_lengths  # (N,)   float32
@@ -223,30 +230,38 @@ class VoxelSimController:
 
         carved_any = False
         last_hit: CollisionHit | None = None
-        for i in range(self._max_idx, new_idx):
+        i = self._max_idx
+        while i < new_idx:
+            # A collinear run (run_ends, dexel only) is carved as one move;
+            # without run_ends, j == i + 1 — one segment, as always.
+            j = i + 1 if self._run_ends is None else min(int(self._run_ends[i]), new_idx)
+
             # Skip G0 rapid moves — feed_rate == 0.0 marks rapid segments.
             # path_buffer.py convention: feed_rates[k] is the feed that
             # ARRIVED at point k (the move from k-1 → k).  So the segment
-            # from i → i+1 is rapid when feeds[i+1] == 0.0.
+            # from i → i+1 is rapid when feeds[i+1] == 0.0. A run never
+            # mixes rapid and feed moves.
             is_rapid = self._feeds[i + 1] == 0.0
 
             # O(1) table lookup, not a live geometry check — see class
             # docstring. line_number is already stamped correctly by
             # prepass.run_prepass(); nothing to re-derive here.
-            hit = None
-            if self._collision_enabled and self._prepass is not None:
-                hit = self._prepass.hits_by_segment.get(i)
-            if hit is not None:
-                self._new_hits.append(hit)
-            last_hit = hit
+            for k in range(i, j):
+                hit = None
+                if self._collision_enabled and self._prepass is not None:
+                    hit = self._prepass.hits_by_segment.get(k)
+                if hit is not None:
+                    self._new_hits.append(hit)
+                last_hit = hit
 
             if not is_rapid:
                 self._carver.carve_segment(
                     self._pts[i],
-                    self._pts[i + 1],
+                    self._pts[j],
                     self._tool,
                 )
                 carved_any = True
+            i = j
 
         self._hit      = last_hit
         self._max_s    = current_s

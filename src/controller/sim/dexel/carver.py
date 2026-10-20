@@ -49,14 +49,13 @@ class DexelCarver:
         cut_len = cutting_length(tool)
         radius_at = tool.profile_radius_at_array
 
-        fx, fy, fz = self._dexels.fields
-        results = [
-            (fz, sweep_z(fz, start, end, self._inverse(tool, cut_len), 0.0, cut_len)),
-            (fx, sweep_horizontal(fx, start, end, radius_at, tool.radius, 0.0, cut_len)),
-            (fy, sweep_horizontal(fy, start, end, radius_at, tool.radius, 0.0, cut_len)),
-        ]
-        for field, res in results:
-            if res is None:
+        fx, fy, fz = self._dexels.fields       # absent ray sets are None
+        for field in (fz, fx, fy):
+            if field is None:
                 continue
-            (iv0, iv1, iu0, iu1), lo, hi = res
-            field.subtract(iv0, iv1, iu0, iu1, lo, hi)
+            if field.axis == 2:
+                res = sweep_z(field, start, end, self._inverse(tool, cut_len), 0.0, cut_len)
+            else:
+                res = sweep_horizontal(field, start, end, radius_at, tool.radius, 0.0, cut_len)
+            if res is not None:
+                field.subtract_rays(*res)

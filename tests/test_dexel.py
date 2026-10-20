@@ -351,3 +351,206 @@ def test_gpu_upload_and_render(gl_ctx, core_app):
     assert img[h // 2, w // 2].sum() < img[8, 8].sum()
     renderer.release()
     grid.release()
+
+
+# ── Collinear runs (grouping.py / dexel prepass) ──────────────────────────────
+
+def _tessellated(moves):
+    """Path like PathBuffer's: each (target, feed) move split into ≤ 1 mm
+    pieces, one G-code line per move."""
+    pts, feeds, lines = [np.array(moves[0][0], "f4")], [0.0], [0]
+    for line, (target, feed) in enumerate(moves[1:], start=1):
+        a, b = pts[-1], np.array(target, "f4")
+        n = max(1, int(np.ceil(np.linalg.norm(b - a) / 1.0)))
+        for k in range(1, n + 1):
+            pts.append(a + (b - a) * (k / n))
+            feeds.append(feed)
+            lines.append(line)
+    return SimpleNamespace(
+        points=np.array(pts, "f4"), feed_rates=np.array(feeds, "f4"),
+        line_ids=np.array(lines, "i4"),
+    )
+
+
+def test_run_ends_respect_line_feed_and_kind():
+    from controller.sim.dexel.grouping import run_ends
+
+    path = _tessellated([
+        ((-15, 0, 5), 0),
+        ((-15, 0, -2), 100),     # plunge → one run
+        ((15, 0, -2), 100),      # level  → one run (new line)
+        ((15, 10, -2), 200),     # level, other feed → own run
+        ((5, 10, -6), 200),      # 3-D ramp → never merged
+    ])
+    ends = run_ends(path.points, path.feed_rates, path.line_ids, 0.05)
+    lines = path.line_ids[1:]
+    starts = [0]
+    while starts[-1] < len(ends):
+        starts.append(int(ends[starts[-1]]))
+    runs = [(s, e) for s, e in zip(starts[:-1], starts[1:])]
+    for s, e in runs:
+        assert len(set(lines[s:e])) == 1          # never crosses a G-code line
+    run_lines = [int(lines[s]) for s, _ in runs]
+    assert run_lines[:3] == [1, 2, 3]             # plunge, level, level: one run each
+    ramp = [e - s for s, e in runs if lines[s] == 4]
+    assert ramp and all(n == 1 for n in ramp)     # ramp pieces stay separate
+
+
+@pytest.mark.parametrize("tool_kw", [
+    {},                                                    # endmill, shank zone above 15 mm
+    {"cutting_length": 2.0, "total_length": 30.0},         # short flutes → shank hits on ramps
+])
+def test_dexel_prepass_runs_identical(tool_kw):
+    """Run-wise processing must give exactly the per-segment results."""
+    from controller.sim.dexel.prepass import run_dexel_prepass
+
+    tool = _tool()
+    for k, v in tool_kw.items():
+        setattr(tool, k, v)
+    path = _tessellated([
+        ((-15, -5, 5), 0),
+        ((-15, -5, -1), 100), ((15, -5, -1), 100),    # level cut
+        ((15, -5, -4), 100), ((-15, -5, -4), 100),    # deeper level cut (shank on short tool)
+        ((-15, 5, -1), 100), ((15, 5, -7), 100),      # 3-D ramp
+        ((15, 5, 5), 0), ((-15, 8, 5), 0),
+        ((-15, 8, -1), 0), ((15, 8, -1), 0),          # rapid through material
+    ])
+    st = _stock()
+    args = (path, [], tool, st, lambda _p: tool, lambda _n: None)
+    seg_a, line_a = run_dexel_prepass(*args, merge_runs=False)
+    seg_b, line_b = run_dexel_prepass(*args, merge_runs=True)
+    assert set(seg_a) == set(seg_b) and set(line_a) == set(line_b)
+    assert seg_a                                       # the scenario does collide
+    for i in seg_a:
+        assert seg_a[i].kind == seg_b[i].kind
+        np.testing.assert_allclose(seg_a[i].point, seg_b[i].point, atol=1e-4)
+
+
+# ── Optional numba kernels (_kernels.py) ──────────────────────────────────────
+
+def _random_field(rng, k: int) -> DexelField:
+    f = DexelField(2, np.zeros(3, "f4"), 1.0, nu=7, nv=5, k=k)
+    f.fill(np.zeros((5, 7), "f4"), np.full((5, 7), 10.0, "f4"))
+    return f
+
+
+@pytest.mark.parametrize("k", [2, 4, 8])
+def test_subtract_numba_matches_numpy_and_reference(k, monkeypatch):
+    """Kernel and numpy path must give bit-identical fields, overflow
+    counts included; without overflow both must equal the Python
+    reference interval lists."""
+    from controller.sim.dexel import _kernels
+
+    if not _kernels.HAVE_NUMBA:
+        pytest.skip("numba not installed")
+    rng = np.random.default_rng(k)
+    for _ in range(60):
+        fa, fb = _random_field(rng, k), _random_field(rng, k)
+        refs = {(v, u): [(0.0, 10.0)] for v in range(5) for u in range(7)}
+        for _ in range(rng.integers(1, 8)):
+            n = int(rng.integers(1, 20))
+            rv = rng.integers(0, 5, n)
+            ru = rng.integers(0, 7, n)
+            # one cut per ray per step (the sweep never repeats a ray)
+            _, uniq = np.unique(rv * 7 + ru, return_index=True)
+            rv, ru = rv[uniq], ru[uniq]
+            lo = rng.uniform(-1.0, 11.0, len(rv)).astype("f4")
+            hi = (lo + rng.uniform(0.0, 4.0, len(rv))).astype("f4")
+            fa.subtract_rays(rv, ru, lo, hi)                     # numba
+            monkeypatch.setattr(_kernels, "HAVE_NUMBA", False)
+            fb.subtract_rays(rv, ru, lo, hi)                     # numpy
+            monkeypatch.setattr(_kernels, "HAVE_NUMBA", True)
+            for v, u, a, b in zip(rv, ru, lo.tolist(), hi.tolist()):
+                nxt = []
+                for s, e in refs[(v, u)]:
+                    if min(e, a) > s:
+                        nxt.append((s, min(e, a)))
+                    if e > max(s, b):
+                        nxt.append((max(s, b), e))
+                refs[(v, u)] = nxt
+        np.testing.assert_array_equal(fa.start, fb.start)
+        np.testing.assert_array_equal(fa.end, fb.end)
+        assert fa.overflow_count == fb.overflow_count
+        assert fa._dirty_tiles == fb._dirty_tiles
+        if fa.overflow_count == 0:
+            for (v, u), ref in refs.items():
+                got = [(float(s), float(e)) for s, e in zip(fa.start[v, u], fa.end[v, u]) if s <= e]
+                assert got == pytest.approx(ref)
+
+
+def test_collision_numba_matches_numpy(monkeypatch):
+    from controller.sim.dexel import _kernels
+
+    if not _kernels.HAVE_NUMBA:
+        pytest.skip("numba not installed")
+    st = _stock()
+    tool = _tool()
+    tool.cutting_length = 2.0
+    cases = [
+        (((-15.13, 0.07, -2.0), (15.13, 0.07, -2.0)), True),
+        (((-15.13, 0.07, -4.0), (15.13, 0.07, -4.0)), False),
+        (((0.07, 0.11, 5.0), (0.07, 0.11, -6.0)), False),
+        (((-15.13, 0.07, 5.0), (15.13, 0.07, 5.0)), True),
+    ]
+    for (a, b), rapid in cases:
+        hits = []
+        for numba_on in (True, False):
+            monkeypatch.setattr(_kernels, "HAVE_NUMBA", numba_on)
+            hits.append(dexel_check(DexelStock(st), *_seg(a, b), tool, rapid))
+        ha, hb = hits
+        assert (ha is None) == (hb is None)
+        if ha is not None:
+            assert ha.kind == hb.kind
+            np.testing.assert_array_equal(ha.point, hb.point)
+
+
+def test_level_cut_volume_analytic_fine():
+    """Acceptance: level 0.1 mm-resolution cut, Z rays within 0.1 %."""
+    r, z, length, h = 3.0, -4.13, 20.26, 0.1
+    dx = DexelStock(_stock(h=h), axes=(2,))
+    DexelCarver(dx).carve_segment(*_seg((-10.13, 0.07, z), (10.13, 0.07, z)), _tool())
+    expected = (2 * r * length + np.pi * r * r) * abs(z)
+    assert 40 * 40 * 10 - dx.volume_mm3(2) == pytest.approx(expected, rel=0.001)
+
+
+@pytest.mark.parametrize("tool_type", [
+    ToolType.ENDMILL, ToolType.BALL_ENDMILL, ToolType.BULL_ENDMILL, ToolType.CHAMFER,
+])
+def test_carve_numba_bit_identical_to_numpy(tool_type, monkeypatch):
+    """Full carve (sweep kernels + subtract kernel) on random level, plunge
+    and 3-D moves: every ray set bit-identical to the numpy path."""
+    from controller.sim.dexel import _kernels
+
+    if not _kernels.HAVE_NUMBA:
+        pytest.skip("numba not installed")
+    tool = _tool(tool_type)
+    tool.corner_radius = 1.0
+    tool.tip_angle = 90.0
+    rng = np.random.default_rng(7)
+    segs = []
+    p = np.array([-12.0, -12.0, -1.0], "f4")
+    for i in range(40):
+        q = p.copy()
+        kind = i % 4
+        if kind == 0:            # level diagonal
+            q[:2] = rng.uniform(-15, 15, 2)
+        elif kind == 1:          # level axis-aligned
+            q[i % 2] = rng.uniform(-15, 15)
+        elif kind == 2:          # plunge
+            q[2] = rng.uniform(-8, 1)
+        else:                    # 3-D
+            q = np.array([*rng.uniform(-15, 15, 2), rng.uniform(-8, 1)], "f4")
+        segs.append((p, q.astype("f4")))
+        p = q.astype("f4")
+    stocks = []
+    for numba_on in (True, False):
+        monkeypatch.setattr(_kernels, "HAVE_NUMBA", numba_on)
+        dx = DexelStock(_stock(h=0.25))
+        c = DexelCarver(dx)
+        for a, b in segs:
+            c.carve_segment(a, b, tool)
+        stocks.append(dx)
+    for fa, fb in zip(*(s.fields for s in stocks)):
+        np.testing.assert_array_equal(fa.start, fb.start)
+        np.testing.assert_array_equal(fa.end, fb.end)
+        assert fa._dirty_tiles == fb._dirty_tiles

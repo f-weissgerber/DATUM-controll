@@ -67,6 +67,7 @@ try:
     from controller.sim.dexel.carver     import DexelCarver
     from controller.sim.dexel.collision  import check_segment as dexel_check_segment
     from controller.sim.dexel.renderer   import DexelRenderer
+    from controller.sim.dexel.grouping   import run_ends as dexel_run_ends
     _VOXEL_AVAILABLE = True
 except ImportError:
     _VOXEL_AVAILABLE = False
@@ -642,6 +643,7 @@ class DatumSimWidget(QWidget):
         self.viewport.makeCurrent()
         try:
             checker = None
+            run_ends = None
             if isinstance(material, np.ndarray):
                 grid   = GpuVoxelGrid(self.viewport.ctx, stock, material=material)
                 carver = VoxelCarver(grid)
@@ -653,6 +655,9 @@ class DatumSimWidget(QWidget):
                 def checker(start, end, tool, is_rapid, holder):
                     return dexel_check_segment(dexels, start, end, tool, is_rapid, holder)
 
+                path = self._last_program.path
+                run_ends = dexel_run_ends(path.points, path.feed_rates, path.line_ids)
+
             active_tool = self._current_tool or get_tool_by_pocket(1)
             self._voxel_ctrl = VoxelSimController(
                 grid             = grid,
@@ -663,6 +668,7 @@ class DatumSimWidget(QWidget):
                 tool             = active_tool,
                 path_line_ids    = self._last_program.path.line_ids,
                 checker          = checker,
+                run_ends         = run_ends,
             )
             self._voxel_ctrl.set_collision_enabled(self._effective_collision_enabled())
             if active_tool is not None:
