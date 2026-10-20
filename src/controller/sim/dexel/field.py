@@ -28,6 +28,8 @@ import math
 
 import numpy as np
 
+from controller.sim.dexel import _kernels
+
 logger = logging.getLogger(__name__)
 
 # Finite sentinels instead of ±inf so the values survive the trip into an
@@ -147,6 +149,10 @@ class DexelField:
         the last kept slot to the furthest dropped end — keeping material,
         never inventing air — and count as an overflow.
         """
+        if _kernels.HAVE_NUMBA:
+            self._subtract_rays_numba(rv, ru, lo, hi)
+            return
+
         # Only rays whose material actually overlaps (lo, hi) change — on a
         # real program most swept rays pass through already-cleared air.
         s_full = self.start[rv, ru]                  # (n, K)
@@ -203,6 +209,35 @@ class DexelField:
         self.end[rv, ru, :k] = new_e
         self._mark_dirty(
             int(rv.min()), int(rv.max()) + 1, int(ru.min()), int(ru.max()) + 1,
+        )
+
+    def _subtract_rays_numba(
+        self, rv: np.ndarray, ru: np.ndarray, lo: np.ndarray, hi: np.ndarray,
+    ) -> None:
+        """subtract_rays() via _kernels.subtract_rays_kernel — bit-identical
+        result (see _kernels.py), same dirty marking and overflow report."""
+        flags = np.empty(len(rv), dtype=np.int8)
+        _kernels.subtract_rays_kernel(
+            self.start, self.end,
+            np.ascontiguousarray(rv, dtype=np.int64), np.ascontiguousarray(ru, dtype=np.int64),
+            np.ascontiguousarray(lo, dtype=np.float32), np.ascontiguousarray(hi, dtype=np.float32),
+            EMPTY_START, EMPTY_END, flags,
+        )
+        changed = flags > 0
+        if not changed.any():
+            return
+        n_over = int(np.count_nonzero(flags == 2))
+        if n_over:
+            if self.overflow_count == 0:
+                logger.warning(
+                    "Dexel field axis %d: %d ray(s) need more than K=%d intervals "
+                    "— keeping material there (raise K for this part).",
+                    self.axis, n_over, self.k,
+                )
+            self.overflow_count += n_over
+        rv_c, ru_c = rv[changed], ru[changed]
+        self._mark_dirty(
+            int(rv_c.min()), int(rv_c.max()) + 1, int(ru_c.min()), int(ru_c.max()) + 1,
         )
 
     # ── Dirty tracking ────────────────────────────────────────────────────────

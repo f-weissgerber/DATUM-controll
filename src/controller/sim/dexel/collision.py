@@ -27,6 +27,7 @@ from typing import Literal
 
 import numpy as np
 
+from controller.sim.dexel import _kernels
 from controller.sim.dexel.stock import DexelStock
 from controller.sim.dexel.sweep import ProfileInverse, stamp_points, sweep_z
 from controller.sim.simulation.tool_definition import ToolDefinition
@@ -194,10 +195,18 @@ def _check_monotone(
     if res is None:
         return None
     rv, ru, lo, hi = res                                      # rays in row-major order
-    s = f.start[rv, ru]                                       # (n, K)
-    e = f.end[rv, ru]
-    overlap = (s < (hi - CONTACT_TOL)[:, np.newaxis]) & (e > (lo + CONTACT_TOL)[:, np.newaxis])
-    ray_hit = overlap.any(axis=1)
+    lo_p = lo + CONTACT_TOL                                   # float32, both paths
+    hi_m = hi - CONTACT_TOL
+    if _kernels.HAVE_NUMBA:
+        first_slot = np.empty(len(rv), dtype=np.int64)
+        _kernels.overlap_rays_kernel(f.start, f.end, rv, ru, lo_p, hi_m, first_slot)
+        ray_hit = first_slot >= 0
+    else:
+        s = f.start[rv, ru]                                   # (n, K)
+        e = f.end[rv, ru]
+        overlap = (s < hi_m[:, np.newaxis]) & (e > lo_p[:, np.newaxis])
+        ray_hit = overlap.any(axis=1)
+        first_slot = np.argmax(overlap, axis=1)
     if not ray_hit.any():
         return None
 
@@ -208,8 +217,8 @@ def _check_monotone(
     ys = f.origin[f.v_axis] + (rv[hit_idx].astype("f4") + 0.5) * f.h
     i = int(np.argmin((xs - start[0]) ** 2 + (ys - start[1]) ** 2))
     n = int(hit_idx[i])
-    k = int(np.argmax(overlap[n]))
-    z = max(float(lo[n]), float(s[n, k]))
+    k = int(first_slot[n])
+    z = max(float(lo[n]), float(f.start[rv[n], ru[n], k]))
     world_pt = np.array([xs[i], ys[i], z], dtype="f4")
 
     kind: Literal["rapid", "shank", "holder"]
