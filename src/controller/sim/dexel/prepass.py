@@ -36,7 +36,8 @@ def run_dexel_prepass(
     None if *abort* was set."""
     import numpy as np
 
-    dexels = solid_dexels(stock)
+    # Collision reads only the Z rays — X/Y would be carved for nothing.
+    dexels = solid_dexels(stock, axes=(2,))
     carver = DexelCarver(dexels)
     pts, feeds, line_ids = path.points, path.feed_rates, path.line_ids
     n_seg = len(pts) - 1
