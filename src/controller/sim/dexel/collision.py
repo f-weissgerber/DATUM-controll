@@ -63,6 +63,26 @@ def _outline_inverse(
     return inv
 
 
+def _zone(tool: ToolDefinition, holder: HolderProfile | None, is_rapid: bool):
+    """(total_len, z_check_lo, full_len) — the checked height zone."""
+    total_len = tool.total_length if tool.total_length > 0.0 else (
+        tool.cutting_length if tool.cutting_length > 0.0 else 999.0
+    )
+    holder_len = holder.gauge_length if holder is not None else 0.0
+    return total_len, (0.0 if is_rapid else tool.cutting_length), total_len + holder_len
+
+
+def is_closed_form(
+    tool: ToolDefinition, holder: HolderProfile | None, is_rapid: bool,
+) -> bool:
+    """True if check_segment() takes the closed-form path for this tool —
+    the path whose result is monotone in the move (a sub-move's checked
+    volume lies inside the whole move's), which the pre-pass relies on to
+    use a whole collinear run's check as a filter for its pieces."""
+    total_len, z_lo, full_len = _zone(tool, holder, is_rapid)
+    return full_len <= z_lo or _outline_inverse(tool, holder, total_len, z_lo, full_len) is not None
+
+
 def check_segment(
     dexels:   DexelStock,
     start:    np.ndarray,
@@ -74,12 +94,7 @@ def check_segment(
     """Return the first collision of *tool* (+ *holder*) moving start→end,
     or None. See module docstring for the rule."""
     vs = dexels.voxel_size
-    total_len = tool.total_length if tool.total_length > 0.0 else (
-        tool.cutting_length if tool.cutting_length > 0.0 else 999.0
-    )
-    holder_len = holder.gauge_length if holder is not None else 0.0
-    full_len = total_len + holder_len
-    z_check_lo = 0.0 if is_rapid else tool.cutting_length
+    total_len, z_check_lo, full_len = _zone(tool, holder, is_rapid)
     if full_len <= z_check_lo:
         return None
 

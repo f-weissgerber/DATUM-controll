@@ -351,3 +351,76 @@ def test_gpu_upload_and_render(gl_ctx, core_app):
     assert img[h // 2, w // 2].sum() < img[8, 8].sum()
     renderer.release()
     grid.release()
+
+
+# ── Collinear runs (grouping.py / dexel prepass) ──────────────────────────────
+
+def _tessellated(moves):
+    """Path like PathBuffer's: each (target, feed) move split into ≤ 1 mm
+    pieces, one G-code line per move."""
+    pts, feeds, lines = [np.array(moves[0][0], "f4")], [0.0], [0]
+    for line, (target, feed) in enumerate(moves[1:], start=1):
+        a, b = pts[-1], np.array(target, "f4")
+        n = max(1, int(np.ceil(np.linalg.norm(b - a) / 1.0)))
+        for k in range(1, n + 1):
+            pts.append(a + (b - a) * (k / n))
+            feeds.append(feed)
+            lines.append(line)
+    return SimpleNamespace(
+        points=np.array(pts, "f4"), feed_rates=np.array(feeds, "f4"),
+        line_ids=np.array(lines, "i4"),
+    )
+
+
+def test_run_ends_respect_line_feed_and_kind():
+    from controller.sim.dexel.grouping import run_ends
+
+    path = _tessellated([
+        ((-15, 0, 5), 0),
+        ((-15, 0, -2), 100),     # plunge → one run
+        ((15, 0, -2), 100),      # level  → one run (new line)
+        ((15, 10, -2), 200),     # level, other feed → own run
+        ((5, 10, -6), 200),      # 3-D ramp → never merged
+    ])
+    ends = run_ends(path.points, path.feed_rates, path.line_ids, 0.05)
+    lines = path.line_ids[1:]
+    starts = [0]
+    while starts[-1] < len(ends):
+        starts.append(int(ends[starts[-1]]))
+    runs = [(s, e) for s, e in zip(starts[:-1], starts[1:])]
+    for s, e in runs:
+        assert len(set(lines[s:e])) == 1          # never crosses a G-code line
+    run_lines = [int(lines[s]) for s, _ in runs]
+    assert run_lines[:3] == [1, 2, 3]             # plunge, level, level: one run each
+    ramp = [e - s for s, e in runs if lines[s] == 4]
+    assert ramp and all(n == 1 for n in ramp)     # ramp pieces stay separate
+
+
+@pytest.mark.parametrize("tool_kw", [
+    {},                                                    # endmill, shank zone above 15 mm
+    {"cutting_length": 2.0, "total_length": 30.0},         # short flutes → shank hits on ramps
+])
+def test_dexel_prepass_runs_identical(tool_kw):
+    """Run-wise processing must give exactly the per-segment results."""
+    from controller.sim.dexel.prepass import run_dexel_prepass
+
+    tool = _tool()
+    for k, v in tool_kw.items():
+        setattr(tool, k, v)
+    path = _tessellated([
+        ((-15, -5, 5), 0),
+        ((-15, -5, -1), 100), ((15, -5, -1), 100),    # level cut
+        ((15, -5, -4), 100), ((-15, -5, -4), 100),    # deeper level cut (shank on short tool)
+        ((-15, 5, -1), 100), ((15, 5, -7), 100),      # 3-D ramp
+        ((15, 5, 5), 0), ((-15, 8, 5), 0),
+        ((-15, 8, -1), 0), ((15, 8, -1), 0),          # rapid through material
+    ])
+    st = _stock()
+    args = (path, [], tool, st, lambda _p: tool, lambda _n: None)
+    seg_a, line_a = run_dexel_prepass(*args, merge_runs=False)
+    seg_b, line_b = run_dexel_prepass(*args, merge_runs=True)
+    assert set(seg_a) == set(seg_b) and set(line_a) == set(line_b)
+    assert seg_a                                       # the scenario does collide
+    for i in seg_a:
+        assert seg_a[i].kind == seg_b[i].kind
+        np.testing.assert_allclose(seg_a[i].point, seg_b[i].point, atol=1e-4)

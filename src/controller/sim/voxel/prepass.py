@@ -119,24 +119,23 @@ def run_prepass(
     DatumSimWidget._start_prepass()'s generation-counter race guard).
     """
     if backend == "dexel":
-        from controller.sim.dexel.carver import DexelCarver
-        from controller.sim.dexel.collision import check_segment as dexel_check
-        from controller.sim.dexel.stock import solid_dexels
+        from controller.sim.dexel.prepass import run_dexel_prepass
 
-        dexels = solid_dexels(stock)
-        carver = DexelCarver(dexels)
+        res = run_dexel_prepass(
+            path, tool_changes, initial_tool, stock, get_tool_by_pocket, get_holder, abort,
+        )
+        if res is None:
+            return None
+        hits_by_segment, hit_by_line = res
+        return CollisionPrepassResult(
+            hits_by_segment=hits_by_segment,
+            hit_by_line=hit_by_line,
+            hit_lines=frozenset(hit_by_line.keys()),
+        )
 
-        def check(start, end, tool, is_rapid, holder):
-            return dexel_check(dexels, start, end, tool, is_rapid, holder)
-    else:
-        material = solid_material(stock)
-        bbox, voxel_size = stock.bbox, stock.voxel_size
-        carver = VoxelCarver(_CpuMaterialSink(material, bbox, voxel_size))
-
-        def check(start, end, tool, is_rapid, holder):
-            return check_segment(
-                material, bbox, voxel_size, start, end, tool, is_rapid, holder,
-            )
+    material = solid_material(stock)
+    bbox, voxel_size = stock.bbox, stock.voxel_size
+    carver = VoxelCarver(_CpuMaterialSink(material, bbox, voxel_size))
 
     pts, feeds, line_ids = path.points, path.feed_rates, path.line_ids
     # Vectorized once, outside the loop — a 1:1 restatement of the per-
@@ -176,7 +175,10 @@ def run_prepass(
             continue
 
         is_rapid = bool(is_rapid_arr[i])
-        hit = check(pts[i], pts[i + 1], current_tool, is_rapid, current_holder)
+        hit = check_segment(
+            material, bbox, voxel_size, pts[i], pts[i + 1],
+            current_tool, is_rapid, current_holder,
+        )
         if hit is not None:
             hit.line_number = int(line_ids[i + 1])
             hits_by_segment[i] = hit
